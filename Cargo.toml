@@ -1,0 +1,11 @@
+[package]
+name = "orgb"
+description = "OpenRGB CLI utility for managing RGB after sleep and wake-up on Windows"
+version = "0.1.0"
+authors = ["Samuel Corsi-House <chouse.samuel@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.1.1", features = ["derive", "cargo"] }
+openrgb = "0.1.2"
+tokio = { version = "1.24.2", features = ["full"] }
