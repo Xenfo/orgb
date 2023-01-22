@@ -23,5 +23,5 @@ jobs:
       - name: Upload the binary
         uses: actions/upload-artifact@v3
         with:
-          name: orgb.exe
-          path: target/**/orgb.exe
+          name: orgb
+          path: target/x86_64-pc-windows-gnu/release/orgb.exe
