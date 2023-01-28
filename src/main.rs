@@ -1,5 +1,8 @@
 #![feature(fs_try_exists)]
 
+#[cfg(not(target_os = "windows"))]
+compile_error!("compilation is only allowed for Windows targets");
+
 use std::{process, ptr};
 
 use openrgb::OpenRGB;
@@ -172,8 +175,8 @@ impl PowerEventManager {
                         _ => None,
                     };
                     let Some(event) = event else {
-                    return LRESULT(0)
-                };
+                        return LRESULT(0)
+                    };
 
                     tx.send(event).unwrap_or_else(|err| {
                         error!("Unable to send the power event: {:#?}", err);
