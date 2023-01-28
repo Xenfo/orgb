@@ -1,342 +1,266 @@
 #![feature(fs_try_exists)]
 
-use std::{fs, time::Duration};
+use std::{process, ptr};
 
-use clap::{command, Parser};
-use directories::ProjectDirs;
 use openrgb::OpenRGB;
-use tokio::{task, time};
+use tokio::sync::broadcast::{self, Receiver};
+use tracing::{debug, error, info, instrument};
 use windows::{
+    core::PCSTR,
     s,
     Win32::{
-        Foundation::HANDLE,
+        Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::{
-            Power::RegisterPowerSettingNotification,
-            Services::{RegisterServiceCtrlHandlerExA, SERVICE_CONTROL_POWEREVENT},
-            SystemServices::GUID_SESSION_DISPLAY_STATUS,
+            Power::{
+                RegisterPowerSettingNotification, RegisterSuspendResumeNotification,
+                DEVICE_NOTIFY_WINDOW_HANDLE, POWERBROADCAST_SETTING,
+            },
+            SystemServices::GUID_CONSOLE_DISPLAY_STATE,
+        },
+        UI::WindowsAndMessaging::{
+            CreateWindowExA, DefWindowProcA, DispatchMessageA, GetMessageA, GetWindowLongPtrA,
+            PostQuitMessage, SetWindowLongPtrA, TranslateMessage, GWLP_USERDATA, GWLP_WNDPROC,
+            HMENU, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, WINDOW_EX_STYLE,
+            WINDOW_STYLE, WM_DESTROY, WM_POWERBROADCAST,
         },
     },
 };
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Starts the event watcher
-    #[arg(short, default_value_t = false)]
-    event_watcher: bool,
-}
-
-unsafe extern "system" fn handler(
-    dwcontrol: u32,
-    dweventtype: u32,
-    lpeventdata: *mut ::core::ffi::c_void,
-    lpcontext: *mut ::core::ffi::c_void,
-) -> u32 {
-    println!(
-        "dwcontrol: {}, dweventtype: {}, lpeventdata: {:?}, lpcontext: {:?}",
-        dwcontrol, dweventtype, lpeventdata, lpcontext
-    );
-
-    0
+#[derive(Clone, Debug)]
+enum PowerEvent {
+    Wake,
+    Sleep,
 }
 
 #[tokio::main]
+#[instrument]
 async fn main() {
-    let args = Args::parse();
+    tracing_subscriber::fmt::init();
 
-    let not_idle_file_path = ProjectDirs::from("dev", "xenfo", "orgb")
-        .unwrap()
-        .config_dir()
-        .to_owned()
-        .join(".not_idle");
+    info!("Starting");
 
-    if args.event_watcher {
-        let result = fs::write(&not_idle_file_path, "");
-        if result.is_err() {
-            fs::create_dir_all(&not_idle_file_path.parent().unwrap()).unwrap();
-            fs::write(&not_idle_file_path, "").unwrap();
-        }
+    let mut manager = PowerEventManager::new();
+    let window = manager.window.clone();
 
-        unsafe {
-            let handle = RegisterServiceCtrlHandlerExA(s!("orgb"), Some(handler), None).unwrap();
-            if handle.is_invalid() {
-                panic!("RegisterServiceCtrlHandlerExA failed");
-            }
-
-            let res = RegisterPowerSettingNotification(
-                HANDLE(handle.0),
-                &GUID_SESSION_DISPLAY_STATUS,
-                SERVICE_CONTROL_POWEREVENT,
-            )
-            .unwrap();
-            if res.is_invalid() {
-                panic!("RegisterPowerSettingNotification failed");
-            }
-        }
-
-        loop {}
-
-        // unsafe {
-        //     // struct PowerParams {
-        //     //     Callback: *const HANDLE,
-        //     // }
-
-        //     // let mut result: *mut *mut void = null_mut();
-
-        //     // let handle = Box::into_raw(Box::new(PowerParams {
-        //     //     Callback: null_mut(),
-        //     // }));
-        //     // let handle_ptr = &*handle as *const HANDLE;
-
-        //     // PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK.0, &*handle as *const HANDLE, result);
-
-        //     let dummy_window = unsafe {
-        //         CreateWindowExW(
-        //             0,
-        //             CLASS_NAME,
-        //             null_mut(),
-        //             0,
-        //             0,
-        //             0,
-        //             0,
-        //             0,
-        //             0,
-        //             0,
-        //             GetModuleHandleW(null_mut()),
-        //             null_mut(),
-        //         )
-        //     };
-        // }
-    } else {
-        let task = task::spawn(async move {
-            let mut interval = time::interval(Duration::from_millis(500));
-
-            loop {
-                interval.tick().await;
-
-                let open_rgb = OpenRGB::connect().await.unwrap();
-
-                if fs::try_exists(&not_idle_file_path).unwrap() {
-                    open_rgb.load_profile("Blue").await.unwrap();
-                } else {
-                    open_rgb.load_profile("Black").await.unwrap();
-                }
-            }
+    tokio::spawn(async move {
+        let open_rgb = OpenRGB::connect().await.unwrap_or_else(|err| {
+            error!("Unable to connect to OpenRGB SDK server: {:#?}", err);
+            process::exit(1)
         });
 
-        task.await.unwrap();
-    }
+        loop {
+            let event = manager.next_event().await;
+            debug!("Power event was received: {:#?}", event);
+
+            let controller_count = open_rgb.get_controller_count().await.unwrap();
+            for id in 0..controller_count {
+                let controller = open_rgb.get_controller(id).await.unwrap();
+
+                let found_mode = controller
+                    .modes
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, mode)| mode.name == "Direct");
+                let Some((index, mode)) = found_mode else {
+                    error!("Unable to find \"Direct\" mode for controller {} ({})", id, controller.name);
+                    continue;
+                };
+
+                open_rgb
+                    .update_mode(id, index as i32, mode)
+                    .await
+                    .unwrap_or_else(|err| {
+                        error!(
+                            "Unable to set controller {} ({}) to \"Direct\" mode: {:#?}",
+                            id, controller.name, err
+                        );
+                    });
+            }
+
+            match event {
+                PowerEvent::Wake => {
+                    if let Err(err) = open_rgb.load_profile("Blue").await {
+                        error!("Unable to load profile \"Blue\": {:#?}", err)
+                    };
+                }
+                PowerEvent::Sleep => {
+                    if let Err(err) = open_rgb.load_profile("Black").await {
+                        error!("Unable to load profile \"Black\": {:#?}", err)
+                    };
+                }
+            };
+        }
+    });
+
+    PowerEventManager::listen(window);
+
+    info!("Exiting");
 }
 
-// use std::{os::windows::io::AsRawHandle, ptr, sync::Arc, thread};
-// use tokio::sync::broadcast;
-// use windows_sys::{
-//     w,
-//     Win32::{
-//         Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
-//         System::{LibraryLoader::GetModuleHandleW, Threading::GetThreadId},
-//         UI::WindowsAndMessaging::{
-//             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-//             GetWindowLongPtrW, PostQuitMessage, PostThreadMessageW, SetWindowLongPtrW,
-//             TranslateMessage, GWLP_USERDATA, GWLP_WNDPROC, PBT_APMRESUMEAUTOMATIC,
-//             PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_DESTROY, WM_POWERBROADCAST, WM_USER,
-//         },
-//     },
-// };
+unsafe extern "system" fn window_procedure<F>(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT
+where
+    F: Fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+{
+    if message == WM_DESTROY {
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
 
-// const CLASS_NAME: *const u16 = w!("STATIC");
-// const REQUEST_THREAD_SHUTDOWN: u32 = WM_USER + 1;
+    let callback = GetWindowLongPtrA(window, GWLP_USERDATA);
+    if callback != 0 {
+        let typed_callback = &mut *(callback as *mut F);
+        return typed_callback(window, message, wparam, lparam);
+    }
 
-// /// Handle for closing an associated window.
-// /// The window is not destroyed when this is dropped.
-// pub struct WindowCloseHandle {
-//     thread: Option<std::thread::JoinHandle<()>>,
-// }
+    DefWindowProcA(window, message, wparam, lparam)
+}
 
-// impl WindowCloseHandle {
-//     /// Close the window and wait for the thread.
-//     pub fn close(&mut self) {
-//         if let Some(thread) = self.thread.take() {
-//             let thread_id = unsafe { GetThreadId(thread.as_raw_handle() as HANDLE) };
-//             unsafe { PostThreadMessageW(thread_id, REQUEST_THREAD_SHUTDOWN, 0, 0) };
-//             let _ = thread.join();
-//         }
-//     }
-// }
+struct PowerEventManager {
+    window: HWND,
+    rx: Receiver<PowerEvent>,
+}
 
-// /// Creates a dummy window whose messages are handled by `wnd_proc`.
-// pub fn create_hidden_window<F: (Fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) + Send + 'static>(
-//     wnd_proc: F,
-// ) -> WindowCloseHandle {
-//     let join_handle = thread::spawn(move || {
-//         let dummy_window = unsafe {
-//             CreateWindowExW(
-//                 0,
-//                 CLASS_NAME,
-//                 ptr::null_mut(),
-//                 0,
-//                 0,
-//                 0,
-//                 0,
-//                 0,
-//                 0,
-//                 0,
-//                 GetModuleHandleW(ptr::null_mut()),
-//                 ptr::null_mut(),
-//             )
-//         };
+impl PowerEventManager {
+    fn new() -> Self {
+        let (tx, rx) = broadcast::channel(16);
 
-//         // Move callback information to the heap.
-//         // This enables us to reach the callback through a "thin pointer".
-//         let raw_callback = Box::into_raw(Box::new(wnd_proc));
+        let window = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE(0),
+                s!("STATIC"),
+                PCSTR(ptr::null()),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND(0),
+                HMENU(0),
+                HINSTANCE(0),
+                None,
+            )
+        };
+        if window.0 == 0 {
+            error!("Unable to create the window");
+            process::exit(1)
+        }
 
-//         unsafe {
-//             SetWindowLongPtrW(dummy_window, GWLP_USERDATA, raw_callback as isize);
-//             SetWindowLongPtrW(dummy_window, GWLP_WNDPROC, window_procedure::<F> as isize);
-//         }
+        let callback =
+            move |window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM| -> LRESULT {
+                if message == WM_POWERBROADCAST {
+                    let event = match wparam.0 as u32 {
+                        PBT_APMSUSPEND => Some(PowerEvent::Sleep),
+                        PBT_APMRESUMESUSPEND => Some(PowerEvent::Wake),
+                        PBT_POWERSETTINGCHANGE => {
+                            let settings = unsafe { &*(lparam.0 as *const POWERBROADCAST_SETTING) };
 
-//         let mut msg = unsafe { std::mem::zeroed() };
+                            if settings.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
+                                match settings.Data[0] {
+                                    0 => Some(PowerEvent::Sleep),
+                                    1 => Some(PowerEvent::Wake),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(event) = event else {
+                    return LRESULT(0)
+                };
 
-//         loop {
-//             let status = unsafe { GetMessageW(&mut msg, 0, 0, 0) };
+                    tx.send(event).unwrap_or_else(|err| {
+                        error!("Unable to send the power event: {:#?}", err);
+                        0
+                    });
 
-//             if status < 0 {
-//                 continue;
-//             }
-//             if status == 0 {
-//                 break;
-//             }
+                    return LRESULT(0);
+                }
 
-//             if msg.hwnd == 0 {
-//                 if msg.message == REQUEST_THREAD_SHUTDOWN {
-//                     unsafe { DestroyWindow(dummy_window) };
-//                 }
-//             } else {
-//                 unsafe {
-//                     TranslateMessage(&mut msg);
-//                     DispatchMessageW(&mut msg);
-//                 }
-//             }
-//         }
+                unsafe { DefWindowProcA(window, message, wparam, lparam) }
+            };
 
-//         // Free callback.
-//         let _ = unsafe { Box::from_raw(raw_callback) };
-//     });
+        let manager = Self { rx, window };
 
-//     WindowCloseHandle {
-//         thread: Some(join_handle),
-//     }
-// }
+        unsafe { manager.set_ptrs(callback) };
 
-// unsafe extern "system" fn window_procedure<F>(
-//     window: HWND,
-//     message: u32,
-//     wparam: WPARAM,
-//     lparam: LPARAM,
-// ) -> LRESULT
-// where
-//     F: Fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-// {
-//     if message == WM_DESTROY {
-//         PostQuitMessage(0);
-//         return 0;
-//     }
-//     let raw_callback = GetWindowLongPtrW(window, GWLP_USERDATA);
-//     if raw_callback != 0 {
-//         let typed_callback = &mut *(raw_callback as *mut F);
-//         return typed_callback(window, message, wparam, lparam);
-//     }
-//     DefWindowProcW(window, message, wparam, lparam)
-// }
+        let unregister_sleep_wake_notification = unsafe {
+            RegisterSuspendResumeNotification(HANDLE(window.0), DEVICE_NOTIFY_WINDOW_HANDLE.0)
+                .unwrap_or_else(|err| {
+                    error!(
+                        "Unable to register for suspend/resume notifications: {:#?}",
+                        err
+                    );
+                    process::exit(1)
+                })
+        };
+        if unregister_sleep_wake_notification.is_invalid() {
+            error!("Unable to register for suspend/resume notifications");
+            process::exit(1)
+        }
 
-// /// Power management events
-// #[non_exhaustive]
-// #[derive(Debug, Clone, Copy, PartialEq)]
-// pub enum PowerManagementEvent {
-//     /// The system is resuming from sleep or hibernation
-//     /// irrespective of user activity.
-//     ResumeAutomatic,
-//     /// The system is resuming from sleep or hibernation
-//     /// due to user activity.
-//     ResumeSuspend,
-//     /// The computer is about to enter a suspended state.
-//     Suspend,
-// }
+        let unregister_power_setting_notification = unsafe {
+            RegisterPowerSettingNotification(
+                HANDLE(window.0),
+                &GUID_CONSOLE_DISPLAY_STATE,
+                DEVICE_NOTIFY_WINDOW_HANDLE.0,
+            )
+            .unwrap_or_else(|err| {
+                error!(
+                    "Unable to register for power setting notifications: {:#?}",
+                    err
+                );
+                process::exit(1)
+            })
+        };
+        if unregister_power_setting_notification.is_invalid() {
+            error!("Unable to register for power setting notifications");
+            process::exit(1)
+        }
 
-// impl PowerManagementEvent {
-//     fn try_from_winevent(wparam: usize) -> Option<Self> {
-//         use PowerManagementEvent::*;
-//         match wparam as u32 {
-//             PBT_APMRESUMEAUTOMATIC => Some(ResumeAutomatic),
-//             PBT_APMRESUMESUSPEND => Some(ResumeSuspend),
-//             PBT_APMSUSPEND => Some(Suspend),
-//             _ => None,
-//         }
-//     }
-// }
+        manager
+    }
 
-// /// Provides power management events to listeners
-// pub struct PowerManagementListener {
-//     _window: Arc<WindowScopedHandle>,
-//     rx: broadcast::Receiver<PowerManagementEvent>,
-// }
+    fn listen(window: HWND) {
+        let mut msg = unsafe { std::mem::zeroed() };
+        loop {
+            let status = unsafe { GetMessageA(&mut msg, window, 0, 0) };
+            if status.0 < 0 {
+                continue;
+            }
+            if status.0 == 0 {
+                break;
+            }
 
-// impl PowerManagementListener {
-//     /// Creates a new listener. This is expensive compared to cloning an existing instance.
-//     pub fn new() -> Self {
-//         let (tx, rx) = tokio::sync::broadcast::channel(16);
+            unsafe {
+                TranslateMessage(&mut msg);
+                DispatchMessageA(&mut msg);
+            }
+        }
+    }
 
-//         let power_broadcast_callback = move |window, message, wparam, lparam| {
-//             if message == WM_POWERBROADCAST {
-//                 if let Some(event) = PowerManagementEvent::try_from_winevent(wparam) {
-//                     if tx.send(event).is_err() {
-//                         println!("Stopping power management event monitor");
-//                         unsafe { PostQuitMessage(0) };
-//                         return 0;
-//                     }
-//                 }
-//             }
-//             unsafe { DefWindowProcW(window, message, wparam, lparam) }
-//         };
+    async fn next_event(&mut self) -> PowerEvent {
+        self.rx.recv().await.unwrap_or_else(|err| {
+            error!("Unable to receive the power event: {:#?}", err);
+            process::exit(1)
+        })
+    }
 
-//         let window = create_hidden_window(power_broadcast_callback);
-
-//         Self {
-//             _window: Arc::new(WindowScopedHandle(window)),
-//             rx,
-//         }
-//     }
-
-//     /// Returns the next power event.
-//     pub async fn next(&mut self) -> Option<PowerManagementEvent> {
-//         loop {
-//             match self.rx.recv().await {
-//                 Ok(event) => break Some(event),
-//                 Err(broadcast::error::RecvError::Closed) => {
-//                     println!("Sender was unexpectedly dropped");
-//                     break None;
-//                 }
-//                 Err(broadcast::error::RecvError::Lagged(num_skipped)) => {
-//                     println!("Skipped {num_skipped} power broadcast events");
-//                 }
-//             }
-//         }
-//     }
-// }
-
-// impl Clone for PowerManagementListener {
-//     fn clone(&self) -> Self {
-//         Self {
-//             _window: self._window.clone(),
-//             rx: self.rx.resubscribe(),
-//         }
-//     }
-// }
-
-// struct WindowScopedHandle(WindowCloseHandle);
-
-// impl Drop for WindowScopedHandle {
-//     fn drop(&mut self) {
-//         self.0.close();
-//     }
-// }
+    unsafe fn set_ptrs<F>(&self, callback: F)
+    where
+        F: Fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    {
+        SetWindowLongPtrA(
+            self.window,
+            GWLP_USERDATA,
+            Box::into_raw(Box::new(callback)) as isize,
+        );
+        SetWindowLongPtrA(self.window, GWLP_WNDPROC, window_procedure::<F> as isize);
+    }
+}
