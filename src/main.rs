@@ -3,10 +3,14 @@
 #[cfg(not(target_os = "windows"))]
 compile_error!("compilation is only allowed for Windows targets");
 
-use std::{process, ptr};
+use std::{process, ptr, time::Duration};
 
 use openrgb::OpenRGB;
-use tokio::sync::broadcast::{self, Receiver};
+use tokio::{
+    net::TcpStream,
+    sync::broadcast::{self, Receiver},
+    time,
+};
 use tracing::{debug, error, info, instrument};
 use windows::{
     core::PCSTR,
@@ -42,43 +46,27 @@ async fn main() {
 
     info!("Starting");
 
+    let open_rgb = open_rgb_connect().await;
+
+    open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
+        error!("Unable to set OpenRGB SDK client name: {:#?}", err);
+        process::exit(1)
+    });
+
+    set_direct_mode(&open_rgb).await;
+    if let Err(err) = open_rgb.load_profile("Blue").await {
+        error!("Unable to load profile \"Blue\": {:#?}", err)
+    };
+
     let mut manager = PowerEventManager::new();
     let window = manager.window.clone();
 
     tokio::spawn(async move {
-        let open_rgb = OpenRGB::connect().await.unwrap_or_else(|err| {
-            error!("Unable to connect to OpenRGB SDK server: {:#?}", err);
-            process::exit(1)
-        });
-
         loop {
             let event = manager.next_event().await;
             debug!("Power event was received: {:#?}", event);
 
-            let controller_count = open_rgb.get_controller_count().await.unwrap();
-            for id in 0..controller_count {
-                let controller = open_rgb.get_controller(id).await.unwrap();
-
-                let found_mode = controller
-                    .modes
-                    .into_iter()
-                    .enumerate()
-                    .find(|(_, mode)| mode.name == "Direct");
-                let Some((index, mode)) = found_mode else {
-                    error!("Unable to find \"Direct\" mode for controller {} ({})", id, controller.name);
-                    continue;
-                };
-
-                open_rgb
-                    .update_mode(id, index as i32, mode)
-                    .await
-                    .unwrap_or_else(|err| {
-                        error!(
-                            "Unable to set controller {} ({}) to \"Direct\" mode: {:#?}",
-                            id, controller.name, err
-                        );
-                    });
-            }
+            set_direct_mode(&open_rgb).await;
 
             match event {
                 PowerEvent::Wake => {
@@ -98,6 +86,57 @@ async fn main() {
     PowerEventManager::listen(window);
 
     info!("Exiting");
+}
+
+async fn open_rgb_connect() -> OpenRGB<TcpStream> {
+    let mut retries_left = 100;
+    let mut interval = time::interval(Duration::from_secs(3));
+
+    loop {
+        interval.tick().await;
+
+        let result = OpenRGB::connect().await;
+        let Ok(open_rgb) = result else {
+            retries_left -= 1;
+            if retries_left == -1 {
+                error!("Unable to connect to OpenRGB SDK server: {:#?}", unsafe { result.unwrap_err_unchecked() });
+                process::exit(1)
+            }
+
+            debug!("Unable to connect to OpenRGB SDK server, {retries_left} retries left");
+
+            continue;
+        };
+
+        return open_rgb;
+    }
+}
+
+async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
+    let controller_count = open_rgb.get_controller_count().await.unwrap();
+    for id in 0..controller_count {
+        let controller = open_rgb.get_controller(id).await.unwrap();
+
+        let found_mode = controller
+            .modes
+            .into_iter()
+            .enumerate()
+            .find(|(_, mode)| mode.name == "Direct");
+        let Some((index, mode)) = found_mode else {
+                    error!("Unable to find \"Direct\" mode for controller {} ({})", id, controller.name);
+                    continue;
+                };
+
+        open_rgb
+            .update_mode(id, index as i32, mode)
+            .await
+            .unwrap_or_else(|err| {
+                error!(
+                    "Unable to set controller {} ({}) to \"Direct\" mode: {:#?}",
+                    id, controller.name, err
+                );
+            });
+    }
 }
 
 unsafe extern "system" fn window_procedure<F>(
