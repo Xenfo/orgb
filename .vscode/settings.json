@@ -1,5 +1,4 @@
 {
-	"cSpell.words": [
-		"orgb"
-	]
+  "rust-analyzer.check.command": "clippy",
+  "cSpell.words": ["orgb"]
 }

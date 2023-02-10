@@ -1,19 +1,21 @@
-#![feature(fs_try_exists)]
+// TODO: Support shutdown events
 
 #[cfg(not(target_os = "windows"))]
 compile_error!("compilation is only allowed for Windows targets");
 
-use std::{process, ptr, time::Duration};
+use std::{process, time::Duration};
 
+use directories::ProjectDirs;
 use openrgb::OpenRGB;
 use tokio::{
     net::TcpStream,
     sync::broadcast::{self, Receiver},
     time,
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, metadata::LevelFilter};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, subscribe::CollectExt, EnvFilter};
 use windows::{
-    core::PCSTR,
     s,
     Win32::{
         Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
@@ -42,7 +44,7 @@ enum PowerEvent {
 #[tokio::main]
 #[instrument]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let _guard = init_tracing();
 
     info!("Starting");
 
@@ -53,13 +55,15 @@ async fn main() {
         process::exit(1)
     });
 
+    time::sleep(Duration::from_secs(5)).await;
+
     set_direct_mode(&open_rgb).await;
     if let Err(err) = open_rgb.load_profile("Blue").await {
         error!("Unable to load profile \"Blue\": {:#?}", err)
     };
 
     let mut manager = PowerEventManager::new();
-    let window = manager.window.clone();
+    let window = manager.window;
 
     tokio::spawn(async move {
         loop {
@@ -88,13 +92,35 @@ async fn main() {
     info!("Exiting");
 }
 
+fn init_tracing() -> WorkerGuard {
+    let config_path = ProjectDirs::from("dev", "Xenfo", "orgb").unwrap();
+
+    let file_appender =
+        tracing_appender::rolling::daily(config_path.data_dir().join("logs"), "orgb.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+    let collector = tracing_subscriber::registry()
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .with(fmt::Subscriber::new().with_writer(std::io::stdout))
+        .with(
+            fmt::Subscriber::new()
+                .with_writer(file_writer)
+                .with_ansi(false),
+        );
+    tracing::collect::set_global_default(collector).unwrap();
+
+    guard
+}
+
 async fn open_rgb_connect() -> OpenRGB<TcpStream> {
     let mut retries_left = 100;
     let mut interval = time::interval(Duration::from_secs(3));
 
     loop {
-        interval.tick().await;
-
         let result = OpenRGB::connect().await;
         let Ok(open_rgb) = result else {
             retries_left -= 1;
@@ -105,17 +131,28 @@ async fn open_rgb_connect() -> OpenRGB<TcpStream> {
 
             debug!("Unable to connect to OpenRGB SDK server, {retries_left} retries left");
 
+            interval.tick().await;
+
             continue;
         };
+
+        debug!("Connected to OpenRGB SDK server");
 
         return open_rgb;
     }
 }
 
 async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
-    let controller_count = open_rgb.get_controller_count().await.unwrap();
+    let controller_count = open_rgb.get_controller_count().await.unwrap_or_else(|err| {
+        error!("Unable to get controller count: {:#?}", err);
+        0
+    });
     for id in 0..controller_count {
-        let controller = open_rgb.get_controller(id).await.unwrap();
+        let controller = open_rgb.get_controller(id).await;
+        let Ok(controller) = controller else {
+            error!("Unable to get controller {id}: {:#?}", unsafe { controller.unwrap_err_unchecked() });
+            continue;
+        };
 
         let found_mode = controller
             .modes
@@ -123,17 +160,17 @@ async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
             .enumerate()
             .find(|(_, mode)| mode.name == "Direct");
         let Some((index, mode)) = found_mode else {
-                    error!("Unable to find \"Direct\" mode for controller {} ({})", id, controller.name);
-                    continue;
-                };
+            error!("Unable to find \"Direct\" mode for controller {id} ({})", controller.name);
+            continue;
+        };
 
         open_rgb
             .update_mode(id, index as i32, mode)
             .await
             .unwrap_or_else(|err| {
                 error!(
-                    "Unable to set controller {} ({}) to \"Direct\" mode: {:#?}",
-                    id, controller.name, err
+                    "Unable to set controller {id} ({}) to \"Direct\" mode: {:#?}",
+                    controller.name, err
                 );
             });
     }
@@ -175,7 +212,7 @@ impl PowerEventManager {
             CreateWindowExA(
                 WINDOW_EX_STYLE(0),
                 s!("STATIC"),
-                PCSTR(ptr::null()),
+                s!("ORGB"),
                 WINDOW_STYLE(0),
                 0,
                 0,
@@ -194,8 +231,8 @@ impl PowerEventManager {
 
         let callback =
             move |window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM| -> LRESULT {
-                if message == WM_POWERBROADCAST {
-                    let event = match wparam.0 as u32 {
+                let event = match message {
+                    WM_POWERBROADCAST => match wparam.0 as u32 {
                         PBT_APMSUSPEND => Some(PowerEvent::Sleep),
                         PBT_APMRESUMESUSPEND => Some(PowerEvent::Wake),
                         PBT_POWERSETTINGCHANGE => {
@@ -212,11 +249,11 @@ impl PowerEventManager {
                             }
                         }
                         _ => None,
-                    };
-                    let Some(event) = event else {
-                        return LRESULT(0)
-                    };
+                    },
+                    _ => None,
+                };
 
+                if let Some(event) = event {
                     tx.send(event).unwrap_or_else(|err| {
                         error!("Unable to send the power event: {:#?}", err);
                         0
@@ -280,6 +317,7 @@ impl PowerEventManager {
                 break;
             }
 
+            #[allow(clippy::unnecessary_mut_passed)]
             unsafe {
                 TranslateMessage(&mut msg);
                 DispatchMessageA(&mut msg);
@@ -303,6 +341,7 @@ impl PowerEventManager {
             GWLP_USERDATA,
             Box::into_raw(Box::new(callback)) as isize,
         );
+        #[allow(clippy::fn_to_numeric_cast)]
         SetWindowLongPtrA(self.window, GWLP_WNDPROC, window_procedure::<F> as isize);
     }
 }
