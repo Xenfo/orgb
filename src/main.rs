@@ -1,7 +1,7 @@
 // TODO: Support shutdown events
 
-// #[cfg(not(target_os = "windows"))]
-// compile_error!("compilation is only allowed for Windows targets");
+#[cfg(not(target_os = "windows"))]
+compile_error!("compilation is only allowed for Windows targets");
 
 use std::{process, time::Duration};
 
