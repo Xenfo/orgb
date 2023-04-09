@@ -1,7 +1,7 @@
 // TODO: Support shutdown events
 
-#[cfg(not(target_os = "windows"))]
-compile_error!("compilation is only allowed for Windows targets");
+// #[cfg(not(target_os = "windows"))]
+// compile_error!("compilation is only allowed for Windows targets");
 
 use std::{process, time::Duration};
 
@@ -12,25 +12,25 @@ use tokio::{
     sync::broadcast::{self, Receiver},
     time,
 };
-use tracing::{debug, error, info, instrument, metadata::LevelFilter};
+use tracing::{debug, error, info, instrument, metadata::LevelFilter, trace};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, subscribe::CollectExt, EnvFilter};
 use windows::{
     s,
     Win32::{
-        Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HANDLE, HMODULE, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             Power::{
                 RegisterPowerSettingNotification, RegisterSuspendResumeNotification,
-                DEVICE_NOTIFY_WINDOW_HANDLE, POWERBROADCAST_SETTING,
+                POWERBROADCAST_SETTING,
             },
             SystemServices::GUID_CONSOLE_DISPLAY_STATE,
         },
         UI::WindowsAndMessaging::{
             CreateWindowExA, DefWindowProcA, DispatchMessageA, GetMessageA, GetWindowLongPtrA,
-            PostQuitMessage, SetWindowLongPtrA, TranslateMessage, GWLP_USERDATA, GWLP_WNDPROC,
-            HMENU, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, WINDOW_EX_STYLE,
-            WINDOW_STYLE, WM_DESTROY, WM_POWERBROADCAST,
+            PostQuitMessage, SetWindowLongPtrA, TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE,
+            GWLP_USERDATA, GWLP_WNDPROC, HMENU, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+            PBT_POWERSETTINGCHANGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_POWERBROADCAST,
         },
     },
 };
@@ -55,7 +55,7 @@ async fn main() {
         process::exit(1)
     });
 
-    time::sleep(Duration::from_secs(5)).await;
+    time::sleep(Duration::from_secs(30)).await;
 
     set_direct_mode(&open_rgb).await;
     if let Err(err) = open_rgb.load_profile("Blue").await {
@@ -102,7 +102,7 @@ fn init_tracing() -> WorkerGuard {
     let collector = tracing_subscriber::registry()
         .with(
             EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
+                .with_default_directive(LevelFilter::TRACE.into())
                 .from_env_lossy(),
         )
         .with(fmt::Subscriber::new().with_writer(std::io::stdout))
@@ -147,12 +147,15 @@ async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
         error!("Unable to get controller count: {:#?}", err);
         0
     });
+    trace!("Controller count: {}", controller_count);
+
     for id in 0..controller_count {
         let controller = open_rgb.get_controller(id).await;
         let Ok(controller) = controller else {
             error!("Unable to get controller {id}: {:#?}", unsafe { controller.unwrap_err_unchecked() });
             continue;
         };
+        trace!("Controller {id}: {:#?}", controller);
 
         let found_mode = controller
             .modes
@@ -163,6 +166,10 @@ async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
             error!("Unable to find \"Direct\" mode for controller {id} ({})", controller.name);
             continue;
         };
+        trace!(
+            "Found \"Direct\" mode for controller {id} ({}) at index {index}",
+            controller.name
+        );
 
         open_rgb
             .update_mode(id, index as i32, mode)
@@ -220,7 +227,7 @@ impl PowerEventManager {
                 0,
                 HWND(0),
                 HMENU(0),
-                HINSTANCE(0),
+                HMODULE(0),
                 None,
             )
         };
@@ -270,7 +277,7 @@ impl PowerEventManager {
         unsafe { manager.set_ptrs(callback) };
 
         let unregister_sleep_wake_notification = unsafe {
-            RegisterSuspendResumeNotification(HANDLE(window.0), DEVICE_NOTIFY_WINDOW_HANDLE.0)
+            RegisterSuspendResumeNotification(HANDLE(window.0), DEVICE_NOTIFY_WINDOW_HANDLE)
                 .unwrap_or_else(|err| {
                     error!(
                         "Unable to register for suspend/resume notifications: {:#?}",
