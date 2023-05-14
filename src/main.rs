@@ -48,6 +48,8 @@ async fn main() {
 
     info!("Starting");
 
+    time::sleep(Duration::from_secs(30)).await;
+
     let open_rgb = open_rgb_connect().await;
 
     open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
