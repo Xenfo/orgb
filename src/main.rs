@@ -35,6 +35,9 @@ use windows::{
     },
 };
 
+const CONNECTION_RETRY_COUNT: i32 = 100;
+const CONTROLLER_COUNT: u32 = 4;
+
 #[derive(Clone, Debug)]
 enum PowerEvent {
     Wake,
@@ -48,16 +51,14 @@ async fn main() {
 
     info!("Starting");
 
-    time::sleep(Duration::from_secs(30)).await;
+    let mut open_rgb = open_rgb_connect().await;
+    while !proper_controller_count(&open_rgb).await {
+        error!("Controller count is not 4, waiting for 3 seconds");
+        time::sleep(Duration::from_secs(3)).await;
 
-    let open_rgb = open_rgb_connect().await;
-
-    open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
-        error!("Unable to set OpenRGB SDK client name: {:#?}", err);
-        process::exit(1)
-    });
-
-    time::sleep(Duration::from_secs(30)).await;
+        open_rgb = open_rgb_connect().await;
+    }
+    debug!("Controller count: {CONTROLLER_COUNT}");
 
     set_direct_mode(&open_rgb).await;
     if let Err(err) = open_rgb.load_profile("Blue").await {
@@ -101,10 +102,15 @@ fn init_tracing() -> WorkerGuard {
         tracing_appender::rolling::daily(config_path.data_dir().join("logs"), "orgb.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
+    #[cfg(debug_assertions)]
+    let log_level = LevelFilter::TRACE;
+    #[cfg(not(debug_assertions))]
+    let log_level = LevelFilter::DEBUG;
+
     let collector = tracing_subscriber::registry()
         .with(
             EnvFilter::builder()
-                .with_default_directive(LevelFilter::TRACE.into())
+                .with_default_directive(log_level.into())
                 .from_env_lossy(),
         )
         .with(fmt::Subscriber::new().with_writer(std::io::stdout))
@@ -119,7 +125,7 @@ fn init_tracing() -> WorkerGuard {
 }
 
 async fn open_rgb_connect() -> OpenRGB<TcpStream> {
-    let mut retries_left = 100;
+    let mut retries_left = CONNECTION_RETRY_COUNT;
     let mut interval = time::interval(Duration::from_secs(3));
 
     loop {
@@ -131,7 +137,7 @@ async fn open_rgb_connect() -> OpenRGB<TcpStream> {
                 process::exit(1)
             }
 
-            debug!("Unable to connect to OpenRGB SDK server, {retries_left} retries left");
+            trace!("Unable to connect to OpenRGB SDK server, {retries_left} retries left");
 
             interval.tick().await;
 
@@ -140,18 +146,25 @@ async fn open_rgb_connect() -> OpenRGB<TcpStream> {
 
         debug!("Connected to OpenRGB SDK server");
 
+        open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
+            error!("Unable to set OpenRGB SDK client name: {:#?}", err);
+            process::exit(1)
+        });
+
         return open_rgb;
     }
 }
 
-async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
+async fn proper_controller_count(open_rgb: &OpenRGB<TcpStream>) -> bool {
     let controller_count = open_rgb.get_controller_count().await.unwrap_or_else(|err| {
         error!("Unable to get controller count: {:#?}", err);
         0
     });
-    trace!("Controller count: {}", controller_count);
+    controller_count == CONTROLLER_COUNT
+}
 
-    for id in 0..controller_count {
+async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
+    for id in 0..CONTROLLER_COUNT {
         let controller = open_rgb.get_controller(id).await;
         let Ok(controller) = controller else {
             error!("Unable to get controller {id}: {:#?}", unsafe { controller.unwrap_err_unchecked() });
@@ -168,7 +181,7 @@ async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
             error!("Unable to find \"Direct\" mode for controller {id} ({})", controller.name);
             continue;
         };
-        trace!(
+        debug!(
             "Found \"Direct\" mode for controller {id} ({}) at index {index}",
             controller.name
         );
