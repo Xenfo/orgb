@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "orgb"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "directories",
  "openrgb",

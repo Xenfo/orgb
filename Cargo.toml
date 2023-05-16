@@ -1,7 +1,7 @@
 [package]
 name = "orgb"
 description = "An OpenRGB CLI utility for managing RGB after sleep and wake-up on Windows"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Samuel Corsi-House <chouse.samuel@gmail.com>"]
 edition = "2021"
 

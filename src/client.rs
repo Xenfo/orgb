@@ -22,12 +22,12 @@ impl OpenRGBClient {
     pub async fn connect(&mut self) {
         let mut interval = time::interval(Duration::from_secs(3));
 
-        for index in 0..ATTEMPTS {
+        for idx in 0..ATTEMPTS {
             let result = OpenRGB::connect().await;
             let Ok(open_rgb) = result else {
-                trace!("Unable to connect to OpenRGB SDK server, {} retries left", ATTEMPTS - index);
+                trace!("Unable to connect to OpenRGB SDK server, {} retries left", ATTEMPTS - idx);
 
-                if index == ATTEMPTS - 1 {
+                if idx == ATTEMPTS - 1 {
                     error!("Unable to connect to OpenRGB SDK server: {:#?}", unsafe { result.unwrap_err_unchecked() });
                     process::exit(1)
                 }
@@ -50,12 +50,37 @@ impl OpenRGBClient {
         self.client = None;
     }
 
-    pub async fn get_controller(&mut self, controller_id: u32) -> Option<Controller> {
-        if self.client.is_none() {
-            self.connect().await;
-        }
+    pub async fn ensure_controllers(&mut self) {
+        for idx in 0..ATTEMPTS {
+            let count = self.client.as_ref().unwrap().get_controller_count().await;
 
-        for index in 0..ATTEMPTS {
+            if let Ok(count) = count {
+                if count == CONTROLLER_COUNT {
+                    debug!("Controller count: {CONTROLLER_COUNT}");
+                    return;
+                }
+            }
+
+            trace!(
+                "Invalid controller count, {} retries left",
+                ATTEMPTS - idx
+            );
+            if idx == ATTEMPTS - 1 {
+                error!("Invalid controller count: {:#?}", count.err());
+                process::exit(1)
+            }
+
+            if let Err(error) = count {
+                self.handle_error(error).await;
+            }
+
+            time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+    }
+
+    pub async fn get_controller(&mut self, controller_id: u32) -> Option<Controller> {
+        for idx in 0..ATTEMPTS {
             let controller = self
                 .client
                 .as_ref()
@@ -68,9 +93,9 @@ impl OpenRGBClient {
                 Err(error) => {
                     trace!(
                         "Unable to get controller {controller_id}, {} retries left",
-                        ATTEMPTS - index
+                        ATTEMPTS - idx
                     );
-                    if index == ATTEMPTS - 1 {
+                    if idx == ATTEMPTS - 1 {
                         error!("Unable to get controller {controller_id}: {:#?}", error);
                         process::exit(1)
                     }
@@ -86,10 +111,6 @@ impl OpenRGBClient {
     }
 
     pub async fn update_mode(&mut self, controller_id: u32, mode_id: i32, mode: Mode) {
-        if self.client.is_none() {
-            self.connect().await;
-        }
-
         for idx in 0..ATTEMPTS {
             let update = self
                 .client
@@ -114,7 +135,7 @@ impl OpenRGBClient {
                     );
                     if idx == ATTEMPTS - 1 {
                         error!(
-                            "Unable to controller {controller_id} to \"Direct\" mode: {:#?}",
+                            "Unable to set mode for controller {controller_id} to \"Direct\" mode: {:#?}",
                             error
                         );
                         process::exit(1)
@@ -152,44 +173,7 @@ impl OpenRGBClient {
         }
     }
 
-    pub async fn ensure_controllers(&mut self) {
-        if self.client.is_none() {
-            self.connect().await;
-        }
-
-        for idx in 0..ATTEMPTS {
-            let count = self.client.as_ref().unwrap().get_controller_count().await;
-
-            if let Ok(count) = count {
-                if count == CONTROLLER_COUNT {
-                    debug!("Controller count: {CONTROLLER_COUNT}");
-                    return;
-                }
-            }
-
-            trace!(
-                "Invalid controller count, {} retries left",
-                ATTEMPTS - idx
-            );
-            if idx == ATTEMPTS - 1 {
-                error!("Invalid controller count: {:#?}", count.err());
-                process::exit(1)
-            }
-
-            if let Err(error) = count {
-                self.handle_error(error).await;
-            }
-
-            time::sleep(Duration::from_secs(3)).await;
-            continue;
-        }
-    }
-
     pub async fn load_profile(&mut self, profile: &str) {
-        if self.client.is_none() {
-            self.connect().await;
-        }
-
         for idx in 0..ATTEMPTS {
             let result = self.client.as_ref().unwrap().load_profile(profile).await;
 
