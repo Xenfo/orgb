@@ -1,18 +1,13 @@
 // TODO: Support shutdown events
 
-#[cfg(not(target_os = "windows"))]
-compile_error!("compilation is only allowed for Windows targets");
+// #[cfg(not(target_os = "windows"))]
+// compile_error!("compilation is only allowed for Windows targets");
 
-use std::{process, time::Duration};
+use std::process;
 
 use directories::ProjectDirs;
-use openrgb::OpenRGB;
-use tokio::{
-    net::TcpStream,
-    sync::broadcast::{self, Receiver},
-    time,
-};
-use tracing::{debug, error, info, instrument, metadata::LevelFilter, trace};
+use tokio::sync::broadcast::{self, Receiver};
+use tracing::{debug, error, info, instrument, metadata::LevelFilter};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, subscribe::CollectExt, EnvFilter};
 use windows::{
@@ -35,8 +30,9 @@ use windows::{
     },
 };
 
-const CONNECTION_RETRY_COUNT: i32 = 100;
-const CONTROLLER_COUNT: u32 = 4;
+use crate::client::OpenRGBClient;
+
+mod client;
 
 #[derive(Clone, Debug)]
 enum PowerEvent {
@@ -51,19 +47,12 @@ async fn main() {
 
     info!("Starting");
 
-    let mut open_rgb = open_rgb_connect().await;
-    while !proper_controller_count(&open_rgb).await {
-        error!("Controller count is not 4, waiting for 3 seconds");
-        time::sleep(Duration::from_secs(3)).await;
+    let mut open_rgb = OpenRGBClient::new();
 
-        open_rgb = open_rgb_connect().await;
-    }
-    debug!("Controller count: {CONTROLLER_COUNT}");
-
-    set_direct_mode(&open_rgb).await;
-    if let Err(err) = open_rgb.load_profile("Blue").await {
-        error!("Unable to load profile \"Blue\": {:#?}", err)
-    };
+    open_rgb.connect().await;
+    open_rgb.ensure_controllers().await;
+    open_rgb.set_direct().await;
+    open_rgb.load_profile("Blue").await;
 
     let mut manager = PowerEventManager::new();
     let window = manager.window;
@@ -73,18 +62,14 @@ async fn main() {
             let event = manager.next_event().await;
             debug!("Power event was received: {:#?}", event);
 
-            set_direct_mode(&open_rgb).await;
+            open_rgb.set_direct().await;
 
             match event {
                 PowerEvent::Wake => {
-                    if let Err(err) = open_rgb.load_profile("Blue").await {
-                        error!("Unable to load profile \"Blue\": {:#?}", err)
-                    };
+                    open_rgb.load_profile("Blue").await;
                 }
                 PowerEvent::Sleep => {
-                    if let Err(err) = open_rgb.load_profile("Black").await {
-                        error!("Unable to load profile \"Black\": {:#?}", err)
-                    };
+                    open_rgb.load_profile("Black").await;
                 }
             };
         }
@@ -122,80 +107,6 @@ fn init_tracing() -> WorkerGuard {
     tracing::collect::set_global_default(collector).unwrap();
 
     guard
-}
-
-async fn open_rgb_connect() -> OpenRGB<TcpStream> {
-    let mut retries_left = CONNECTION_RETRY_COUNT;
-    let mut interval = time::interval(Duration::from_secs(3));
-
-    loop {
-        let result = OpenRGB::connect().await;
-        let Ok(open_rgb) = result else {
-            retries_left -= 1;
-            if retries_left == -1 {
-                error!("Unable to connect to OpenRGB SDK server: {:#?}", unsafe { result.unwrap_err_unchecked() });
-                process::exit(1)
-            }
-
-            trace!("Unable to connect to OpenRGB SDK server, {retries_left} retries left");
-
-            interval.tick().await;
-
-            continue;
-        };
-
-        debug!("Connected to OpenRGB SDK server");
-
-        open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
-            error!("Unable to set OpenRGB SDK client name: {:#?}", err);
-            process::exit(1)
-        });
-
-        return open_rgb;
-    }
-}
-
-async fn proper_controller_count(open_rgb: &OpenRGB<TcpStream>) -> bool {
-    let controller_count = open_rgb.get_controller_count().await.unwrap_or_else(|err| {
-        error!("Unable to get controller count: {:#?}", err);
-        0
-    });
-    controller_count == CONTROLLER_COUNT
-}
-
-async fn set_direct_mode(open_rgb: &OpenRGB<TcpStream>) {
-    for id in 0..CONTROLLER_COUNT {
-        let controller = open_rgb.get_controller(id).await;
-        let Ok(controller) = controller else {
-            error!("Unable to get controller {id}: {:#?}", unsafe { controller.unwrap_err_unchecked() });
-            continue;
-        };
-        trace!("Controller {id}: {:#?}", controller);
-
-        let found_mode = controller
-            .modes
-            .into_iter()
-            .enumerate()
-            .find(|(_, mode)| mode.name == "Direct");
-        let Some((index, mode)) = found_mode else {
-            error!("Unable to find \"Direct\" mode for controller {id} ({})", controller.name);
-            continue;
-        };
-        debug!(
-            "Found \"Direct\" mode for controller {id} ({}) at index {index}",
-            controller.name
-        );
-
-        open_rgb
-            .update_mode(id, index as i32, mode)
-            .await
-            .unwrap_or_else(|err| {
-                error!(
-                    "Unable to set controller {id} ({}) to \"Direct\" mode: {:#?}",
-                    controller.name, err
-                );
-            });
-    }
 }
 
 unsafe extern "system" fn window_procedure<F>(
