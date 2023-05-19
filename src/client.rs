@@ -1,8 +1,8 @@
-use std::{process, time::Duration};
+use std::time::Duration;
 
 use openrgb::{
     data::{Controller, Mode},
-    OpenRGB, OpenRGBError,
+    OpenRGB,
 };
 use tokio::{net::TcpStream, time};
 use tracing::{debug, error, trace};
@@ -29,7 +29,7 @@ impl OpenRGBClient {
 
                 if idx == ATTEMPTS - 1 {
                     error!("Unable to connect to OpenRGB SDK server: {:#?}", unsafe { result.unwrap_err_unchecked() });
-                    process::exit(1)
+                    break;
                 }
 
                 interval.tick().await;
@@ -40,7 +40,6 @@ impl OpenRGBClient {
 
             open_rgb.set_name("ORGB").await.unwrap_or_else(|err| {
                 error!("Unable to set OpenRGB SDK client name: {:#?}", err);
-                process::exit(1)
             });
 
             self.client = Some(open_rgb);
@@ -61,17 +60,14 @@ impl OpenRGBClient {
                 }
             }
 
-            trace!(
-                "Invalid controller count, {} retries left",
-                ATTEMPTS - idx
-            );
+            trace!("Invalid controller count, {} retries left", ATTEMPTS - idx);
             if idx == ATTEMPTS - 1 {
                 error!("Invalid controller count: {:#?}", count.err());
-                process::exit(1)
+                break;
             }
 
-            if let Err(error) = count {
-                self.handle_error(error).await;
+            if count.is_err() {
+                self.connect().await;
             }
 
             time::sleep(Duration::from_secs(3)).await;
@@ -97,10 +93,10 @@ impl OpenRGBClient {
                     );
                     if idx == ATTEMPTS - 1 {
                         error!("Unable to get controller {controller_id}: {:#?}", error);
-                        process::exit(1)
+                        break;
                     }
 
-                    self.handle_error(error).await;
+                    self.connect().await;
                     time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -138,10 +134,10 @@ impl OpenRGBClient {
                             "Unable to set mode for controller {controller_id} to \"Direct\" mode: {:#?}",
                             error
                         );
-                        process::exit(1)
+                        break;
                     }
 
-                    self.handle_error(error).await;
+                    self.connect().await;
                     time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -162,7 +158,7 @@ impl OpenRGBClient {
                 .find(|(_, mode)| mode.name == "Direct");
             let Some((index, mode)) = found_mode else {
                 error!("Unable to find \"Direct\" mode for controller {id} ({})", controller.name);
-                process::exit(1);
+                break;
             };
             debug!(
                 "Found \"Direct\" mode for controller {id} ({}) at index {index}",
@@ -180,23 +176,19 @@ impl OpenRGBClient {
             match result {
                 Ok(_) => return,
                 Err(error) => {
-                    trace!("Unable to load profile \"{profile}\", {} retries left", ATTEMPTS - idx);
+                    trace!(
+                        "Unable to load profile \"{profile}\", {} retries left",
+                        ATTEMPTS - idx
+                    );
                     if idx == ATTEMPTS - 1 {
                         error!("Unable to load profile \"{profile}\": {:#?}", error);
+                        break;
                     }
 
-                    self.handle_error(error).await;
+                    self.connect().await;
                     time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
-            }
-        }
-    }
-
-    pub async fn handle_error(&mut self, error: OpenRGBError) {
-        if let OpenRGBError::CommunicationError { source } = error {
-            if source.kind() == std::io::ErrorKind::ConnectionReset {
-                self.connect().await;
             }
         }
     }
